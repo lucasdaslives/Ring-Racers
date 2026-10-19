@@ -1,0 +1,594 @@
+name: Build Ring Racers APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      RR_COMMIT: 4bad15a4073d6f5ef828d1b9b0bb248257785f63
+      SDL_TAG: release-3.2.30
+      GL4ES_COMMIT: a025615bc79ac43ec911dced8fe5b8eb45a0b72d
+      VCPKG_COMMIT: d5ec528843d29e3a52d745a64b469f810b2cedbf
+      API: "26"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Write project files
+        run: |
+          set -e
+          mkdir -p "$(dirname patches/ringracers-android.patch)"
+          cat > patches/ringracers-android.patch <<'RR_EOF'
+          diff --git a/CMakeLists.txt b/CMakeLists.txt
+          index ad7cc58..3b06c53 100644
+          --- a/CMakeLists.txt
+          +++ b/CMakeLists.txt
+          @@ -92,7 +92,12 @@ set(SRB2_SDL2_EXE_SUFFIX "" CACHE STRING "Optional executable suffix, separated
+           
+           set(GIT_EXECUTABLE "git" CACHE FILEPATH "Path to git binary")
+           
+          -add_executable(SRB2SDL2 MACOSX_BUNDLE WIN32)
+          +if(ANDROID)
+          +	# SDL3 on Android loads the game from libmain.so
+          +	add_library(SRB2SDL2 SHARED)
+          +else()
+          +	add_executable(SRB2SDL2 MACOSX_BUNDLE WIN32)
+          +endif()
+           target_compile_features(SRB2SDL2 PRIVATE c_std_17 cxx_std_20)
+           set_target_properties(SRB2SDL2 PROPERTIES
+           	C_STANDARD 17
+          @@ -138,6 +143,9 @@ list(APPEND EXE_NAME_PARTS ${SRB2_SDL2_EXE_SUFFIX})
+           
+           list(JOIN EXE_NAME_PARTS "_" EXE_NAME)
+           set_target_properties(SRB2SDL2 PROPERTIES OUTPUT_NAME "${EXE_NAME}")
+          +if(ANDROID)
+          +	set_target_properties(SRB2SDL2 PROPERTIES OUTPUT_NAME "main")
+          +endif()
+           
+           if(NOT SRB2_CONFIG_SKIP_COMPTIME)
+           	# This updates the modification time for comptime.c at the
+          diff --git a/src/d_main.cpp b/src/d_main.cpp
+          index 6716981..d943f3c 100644
+          --- a/src/d_main.cpp
+          +++ b/src/d_main.cpp
+          @@ -2307,10 +2307,6 @@ const char *D_Home(void)
+           {
+           	const char *userhome = NULL;
+           
+          -#ifdef ANDROID
+          -	return "/data/data/org.srb2/";
+          -#endif
+          -
+           	if (M_CheckParm("-home") && M_IsNextParm())
+           		userhome = M_GetNextParm();
+           	else
+          diff --git a/src/sdl/CMakeLists.txt b/src/sdl/CMakeLists.txt
+          index 3b66a0f..1b2e82b 100644
+          --- a/src/sdl/CMakeLists.txt
+          +++ b/src/sdl/CMakeLists.txt
+          @@ -69,3 +69,15 @@ if("${CMAKE_SYSTEM_NAME}" MATCHES Windows)
+           endif()
+           
+           target_compile_definitions(SRB2SDL2 PRIVATE -DHAVE_SDL -DHAVE_SDL3)
+          +
+          +if(ANDROID)
+          +	# gl4es provides desktop GL 2.1 on top of the GLES2 context created by SDL
+          +	set(GL4ES_LIBRARY "" CACHE FILEPATH "Path to the gl4es static lib (libGL.a) built for Android")
+          +	if(NOT GL4ES_LIBRARY)
+          +		message(FATAL_ERROR "Set -DGL4ES_LIBRARY=/path/to/libGL.a for Android builds")
+          +	endif()
+          +	add_library(gl4es_android UNKNOWN IMPORTED)
+          +	set_target_properties(gl4es_android PROPERTIES IMPORTED_LOCATION "${GL4ES_LIBRARY}")
+          +	target_link_libraries(SRB2SDL2 PRIVATE gl4es_android log android)
+          +	target_compile_definitions(SRB2SDL2 PRIVATE -DSRB2_ANDROID_GL4ES)
+          +endif()
+          diff --git a/src/sdl/i_main.cpp b/src/sdl/i_main.cpp
+          index cab8ce1..ca6ee87 100644
+          --- a/src/sdl/i_main.cpp
+          +++ b/src/sdl/i_main.cpp
+          @@ -216,6 +216,19 @@ int main(int argc, char **argv)
+           
+           	tracy::SetThreadName("Main");
+           
+          +#ifdef __ANDROID__
+          +	{
+          +		// Game data lives in the app's external files dir:
+          +		// /storage/emulated/0/Android/data/<package>/files
+          +		const char *ext = SDL_GetAndroidExternalStoragePath();
+          +		if (ext != NULL)
+          +		{
+          +			setenv("HOME", ext, 1);
+          +			setenv("RINGRACERSWADDIR", ext, 0);
+          +		}
+          +	}
+          +#endif
+          +
+           #ifdef _WIN32
+           	ChDirToExe();
+           #endif
+          diff --git a/src/sdl/i_system.cpp b/src/sdl/i_system.cpp
+          index d7dd3ed..fa3e120 100644
+          --- a/src/sdl/i_system.cpp
+          +++ b/src/sdl/i_system.cpp
+          @@ -144,7 +144,7 @@ typedef LPVOID (WINAPI *p_MapViewOfFile) (HANDLE, DWORD, DWORD, DWORD, SIZE_T);
+           #include <errno.h>
+           #endif
+           
+          -#if (defined(__linux__) && defined(__USE_GNU)) || (defined (__unix__) || defined (UNIXCOMMON)) && !defined(__linux__) || defined(__APPLE__)
+          +#if !defined(__ANDROID__) && (defined(__linux__) && defined(__USE_GNU)) || (defined (__unix__) || defined (UNIXCOMMON)) && !defined(__linux__) || defined(__APPLE__)
+           #include <execinfo.h>
+           #include <time.h>
+           #define UNIXBACKTRACE
+          diff --git a/src/sdl/i_video.cpp b/src/sdl/i_video.cpp
+          index c8c8adb..b70427d 100644
+          --- a/src/sdl/i_video.cpp
+          +++ b/src/sdl/i_video.cpp
+          @@ -1300,13 +1300,36 @@ static void init_imgui()
+           	ImGui::StyleColorsDark();
+           }
+           
+          +#ifdef SRB2_ANDROID_GL4ES
+          +extern "C" void initialize_gl4es(void);
+          +extern "C" void* gl4es_GetProcAddress(const char* name);
+          +
+          +static void Impl_SetAndroidGLAttributes(void)
+          +{
+          +	SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+          +	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+          +	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+          +	SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+          +	SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+          +}
+          +
+          +static rhi::GlProc Impl_Gl4esLoad(const char* name)
+          +{
+          +	return reinterpret_cast<rhi::GlProc>(gl4es_GetProcAddress(name));
+          +}
+          +#endif
+          +
+           static bool Impl_CreateContext(void)
+           {
+           	if (!sdlglcontext)
+           	{
+           		SDL_GL_ResetAttributes();
+          +#ifdef SRB2_ANDROID_GL4ES
+          +		Impl_SetAndroidGLAttributes();
+          +#else
+           		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+           		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+          +#endif
+           		sdlglcontext = SDL_GL_CreateContext(window);
+           	}
+           	if (sdlglcontext == NULL)
+          @@ -1316,6 +1339,9 @@ static bool Impl_CreateContext(void)
+           	}
+           	init_imgui();
+           	SDL_GL_MakeCurrent(window, sdlglcontext);
+          +#ifdef SRB2_ANDROID_GL4ES
+          +	initialize_gl4es();
+          +#endif
+           
+           #ifdef HWRENDER
+           	if (rendermode == render_opengl)
+          @@ -1328,7 +1354,11 @@ static bool Impl_CreateContext(void)
+           	{
+           		std::unique_ptr<rhi::SdlGl2Platform> platform = std::make_unique<rhi::SdlGl2Platform>();
+           		platform->window = window;
+          +		#ifdef SRB2_ANDROID_GL4ES
+          +		g_rhi = std::make_unique<rhi::Gl2Rhi>(std::move(platform), Impl_Gl4esLoad);
+          +#else
+           		g_rhi = std::make_unique<rhi::Gl2Rhi>(std::move(platform), reinterpret_cast<rhi::GlLoadFunc>(SDL_GL_GetProcAddress));
+          +#endif
+           		g_rhi_generation += 1;
+           	}
+           
+          @@ -1454,6 +1484,10 @@ static bool Impl_CreateWindow(bool fullscreen)
+           
+           	// RHI: always create window as OPENGL
+           	flags |= SDL_WINDOW_OPENGL;
+          +#ifdef SRB2_ANDROID_GL4ES
+          +	Impl_SetAndroidGLAttributes();
+          +	flags |= SDL_WINDOW_FULLSCREEN;
+          +#endif
+           
+           	// Create a window
+           	window = SDL_CreateWindow("Dr. Robotnik's Ring Racers " VERSIONSTRING,
+          RR_EOF
+          mkdir -p "$(dirname android-port/vcpkg/vcpkg.json)"
+          cat > android-port/vcpkg/vcpkg.json <<'RR_EOF'
+          {
+            "name": "ringracers-android",
+            "version": "1.0.0",
+            "builtin-baseline": "d5ec528843d29e3a52d745a64b469f810b2cedbf",
+            "dependencies": [ "zlib", "libpng", "curl", "opus" ]
+          }
+          RR_EOF
+          mkdir -p "$(dirname android-port/settings.gradle)"
+          cat > android-port/settings.gradle <<'RR_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "RingRacersAndroid"
+          include ':app'
+          RR_EOF
+          mkdir -p "$(dirname android-port/build.gradle)"
+          cat > android-port/build.gradle <<'RR_EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          RR_EOF
+          mkdir -p "$(dirname android-port/gradle.properties)"
+          cat > android-port/gradle.properties <<'RR_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/build.gradle)"
+          cat > android-port/app/build.gradle <<'RR_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'org.ringracers.androidport'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'org.ringracers.androidport'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '2.0-android-port'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+
+              buildTypes {
+                  release { minifyEnabled false }
+              }
+
+              sourceSets {
+                  main { jniLibs.srcDirs = ['src/main/jniLibs'] }
+              }
+
+              packaging {
+                  jniLibs { useLegacyPackaging = true }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/src/main/AndroidManifest.xml)"
+          cat > android-port/app/src/main/AndroidManifest.xml <<'RR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:hardwareAccelerated="true"
+                  android:requestLegacyExternalStorage="true"
+                  android:extractNativeLibs="true">
+
+                  <activity
+                      android:name=".RRActivity"
+                      android:label="@string/app_name"
+                      android:exported="true"
+                      android:launchMode="singleInstance"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+                      android:preferMinimalPostProcessing="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/src/main/res/values/strings.xml)"
+          cat > android-port/app/src/main/res/values/strings.xml <<'RR_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Ring Racers (Android)</string>
+          </resources>
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/src/main/java/org/ringracers/androidport/RRActivity.java)"
+          cat > android-port/app/src/main/java/org/ringracers/androidport/RRActivity.java <<'RR_EOF'
+          package org.ringracers.androidport;
+
+          import android.os.Bundle;
+          import android.view.ViewGroup;
+
+          import org.libsdl.app.SDLActivity;
+
+          import java.io.File;
+
+          /**
+           * Launches the game through SDL and draws an on-screen touch pad on top of it.
+           * Game data (the official .pk3 files) goes in:
+           *   Android/data/org.ringracers.androidport/files/
+           */
+          public class RRActivity extends SDLActivity {
+
+              @Override
+              protected String[] getLibraries() {
+                  return new String[] { "SDL3", "main" };
+              }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  File dir = getExternalFilesDir(null);
+                  if (dir != null) {
+                      //noinspection ResultOfMethodCallIgnored
+                      dir.mkdirs();
+                  }
+                  super.onCreate(savedInstanceState);
+                  if (mLayout != null) {
+                      mLayout.addView(new TouchOverlay(this),
+                              new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                                      ViewGroup.LayoutParams.MATCH_PARENT));
+                  }
+              }
+          }
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/src/main/java/org/ringracers/androidport/TouchOverlay.java)"
+          cat > android-port/app/src/main/java/org/ringracers/androidport/TouchOverlay.java <<'RR_EOF'
+          package org.ringracers.androidport;
+
+          import android.content.Context;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.view.KeyEvent;
+          import android.view.MotionEvent;
+          import android.view.View;
+
+          import org.libsdl.app.SDLActivity;
+
+          /**
+           * Multi-touch on-screen buttons that inject Android key events into SDL.
+           * The keys match Ring Racers' default keyboard bindings:
+           *   A = Accelerate / Confirm, D = Brake / Back, S = Drift, Space = Use Item,
+           *   Shift = Look back, Q = Spin Dash, V = Ring Bail, Esc = Pause,
+           *   arrows = steer / menu navigation.
+           */
+          public class TouchOverlay extends View {
+
+              private static final class Btn {
+                  final String label;
+                  final int keycode;
+                  final float cx, cy; // fraction of view size
+                  final float r;      // radius in "units" (1 unit = 1% of the smaller side)
+                  boolean down;
+
+                  Btn(String label, int keycode, float cx, float cy, float r) {
+                      this.label = label;
+                      this.keycode = keycode;
+                      this.cx = cx;
+                      this.cy = cy;
+                      this.r = r;
+                  }
+              }
+
+              private final Btn[] buttons = new Btn[] {
+                  // D-pad (left side)
+                  new Btn("<", KeyEvent.KEYCODE_DPAD_LEFT,  0.08f, 0.78f, 8.5f),
+                  new Btn(">", KeyEvent.KEYCODE_DPAD_RIGHT, 0.24f, 0.78f, 8.5f),
+                  new Btn("^", KeyEvent.KEYCODE_DPAD_UP,    0.16f, 0.58f, 8.0f),
+                  new Btn("v", KeyEvent.KEYCODE_DPAD_DOWN,  0.16f, 0.93f, 6.5f),
+                  // Action cluster (right side)
+                  new Btn("ACEL",   KeyEvent.KEYCODE_A,     0.91f, 0.76f, 11.0f),
+                  new Btn("FREIO",  KeyEvent.KEYCODE_D,     0.77f, 0.88f, 8.0f),
+                  new Btn("DRIFT",  KeyEvent.KEYCODE_S,     0.77f, 0.64f, 8.0f),
+                  new Btn("ITEM",   KeyEvent.KEYCODE_SPACE, 0.91f, 0.48f, 8.0f),
+                  // Small extras
+                  new Btn("TRAS",   KeyEvent.KEYCODE_SHIFT_LEFT, 0.65f, 0.86f, 5.5f),
+                  new Btn("SPIN",   KeyEvent.KEYCODE_Q,     0.65f, 0.70f, 5.5f),
+                  new Btn("BAIL",   KeyEvent.KEYCODE_V,     0.77f, 0.42f, 5.5f),
+                  // Menu / pause (top center)
+                  new Btn("VOLTAR", KeyEvent.KEYCODE_DEL,   0.40f, 0.09f, 5.5f),
+                  new Btn("ENTER",  KeyEvent.KEYCODE_ENTER, 0.50f, 0.09f, 5.5f),
+                  new Btn("PAUSA",  KeyEvent.KEYCODE_ESCAPE, 0.60f, 0.09f, 5.5f),
+              };
+
+              private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+              private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+              public TouchOverlay(Context context) {
+                  super(context);
+                  setFocusable(false);
+                  stroke.setStyle(Paint.Style.STROKE);
+                  stroke.setStrokeWidth(3f);
+                  stroke.setColor(0x99FFFFFF);
+                  text.setColor(0xCCFFFFFF);
+                  text.setTextAlign(Paint.Align.CENTER);
+              }
+
+              private float unit() {
+                  return Math.min(getWidth(), getHeight()) / 100f;
+              }
+
+              private boolean hit(Btn b, float x, float y) {
+                  float px = b.cx * getWidth();
+                  float py = b.cy * getHeight();
+                  float rr = b.r * unit() * 1.25f; // slightly generous touch area
+                  float dx = x - px;
+                  float dy = y - py;
+                  return dx * dx + dy * dy <= rr * rr;
+              }
+
+              @Override
+              public boolean onTouchEvent(MotionEvent e) {
+                  int action = e.getActionMasked();
+                  boolean[] now = new boolean[buttons.length];
+
+                  if (action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL) {
+                      int skip = (action == MotionEvent.ACTION_POINTER_UP) ? e.getActionIndex() : -1;
+                      for (int i = 0; i < e.getPointerCount(); i++) {
+                          if (i == skip) continue;
+                          float x = e.getX(i);
+                          float y = e.getY(i);
+                          for (int b = 0; b < buttons.length; b++) {
+                              if (hit(buttons[b], x, y)) now[b] = true;
+                          }
+                      }
+                  }
+
+                  for (int b = 0; b < buttons.length; b++) {
+                      if (now[b] != buttons[b].down) {
+                          buttons[b].down = now[b];
+                          if (now[b]) {
+                              SDLActivity.onNativeKeyDown(buttons[b].keycode);
+                          } else {
+                              SDLActivity.onNativeKeyUp(buttons[b].keycode);
+                          }
+                      }
+                  }
+                  invalidate();
+                  return true;
+              }
+
+              @Override
+              protected void onDraw(Canvas canvas) {
+                  float u = unit();
+                  for (Btn b : buttons) {
+                      float px = b.cx * getWidth();
+                      float py = b.cy * getHeight();
+                      float rr = b.r * u;
+                      fill.setColor(b.down ? 0x88FFFFFF : 0x33000000);
+                      canvas.drawCircle(px, py, rr, fill);
+                      canvas.drawCircle(px, py, rr, stroke);
+                      text.setTextSize(Math.max(rr * 0.42f, 22f));
+                      canvas.drawText(b.label, px, py + text.getTextSize() * 0.35f, text);
+                  }
+              }
+          }
+          RR_EOF
+          mkdir -p "$(dirname android-port/app/src/main/res/mipmap-xxhdpi/ic_launcher.png)"
+          echo "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAMAAACdt4HsAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAABXUExURQAAAP///7NzR+OXZ//Ll39TL//Ps1M/H4dDB3UpAF8AAEFBg5tbE1JS/yEiTv8/P68AAP9fX0cAAP+3i7+/v+Tk5JeXl38AAMObL98AAOvbV///AAAAAK8kJGgAAAAddFJOU/////////////////////////////////////8AWYbnagAAAAlwSFlzAAAuIgAALiIBquLdkgAAARJJREFUWEfdlUcSg0AQA41zzgnj/7/T6i1NFQb8AE9fmCDpMIdl9P5B1cHjHhkDrK/GHTzuBWULQIB4IqYdmEWQ5YVMASxmIsxzwQyoIwQNM9tSBBSFWAiOhDDACG4LaNDaVmUIWIqVWIs44MYUh3BbejRo8eDNELA1EcSRdgYxuN2xC6Nt2wwB7QFf+r05GLf7IW2GAJouLI/iZKiZef1FhgAO8Qv7T24HyRBwFvFAXMRV3MRd8IWo2aFBiwdvhoCHeQoeDAT8MBCXP4eImh0atLY9sgUAB+IhRVz+KoKaGTvLUgXwWNTiJRrDoRC3YeZ1gxYP3gwBFOBdw4FYDMHOssa2OltAmD3q0Q7x6P8D6voDMo7fAUk5CoIAAAAASUVORK5CYII=" | base64 -d > android-port/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+
+      - name: Fetch upstream sources
+        run: |
+          set -e
+          fetch_commit() { # dir url sha
+            git init -q "$1"
+            git -C "$1" remote add origin "$2"
+            git -C "$1" fetch -q --depth 1 origin "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          fetch_commit rr https://github.com/KartKrewDev/RingRacers.git "$RR_COMMIT"
+          fetch_commit gl4es https://github.com/ptitSeb/gl4es.git "$GL4ES_COMMIT"
+          git clone -q --depth 1 --branch "$SDL_TAG" https://github.com/libsdl-org/SDL.git sdl
+          git -C rr apply --whitespace=nowarn "$GITHUB_WORKSPACE/patches/ringracers-android.patch"
+
+      - name: Build SDL3 (arm64)
+        run: |
+          set -e
+          cmake -S sdl -B build-sdl -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API \
+            -DSDL_SHARED=ON -DSDL_STATIC=OFF -DSDL_TESTS=OFF -DSDL_INSTALL=ON \
+            -DCMAKE_INSTALL_PREFIX="$PWD/sdl-install"
+          cmake --build build-sdl
+          cmake --install build-sdl
+          ls sdl-install/lib
+
+      - name: Build gl4es (static, arm64)
+        run: |
+          set -e
+          "$ANDROID_NDK_HOME/ndk-build" -C gl4es \
+            NDK_PROJECT_PATH="$PWD/gl4es" APP_BUILD_SCRIPT="$PWD/gl4es/Android.mk" \
+            APP_ABI=arm64-v8a APP_PLATFORM=android-$API \
+            NDK_OUT="$PWD/gl4es-out" NDK_LIBS_OUT="$PWD/gl4es-libs"
+          find gl4es-out gl4es-libs -name 'libGL.*'
+
+      - name: Set up vcpkg
+        run: |
+          set -e
+          git clone -q https://github.com/microsoft/vcpkg.git vcpkg
+          git -C vcpkg checkout -q "$VCPKG_COMMIT"
+          ./vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+      - name: Build the game (libmain.so)
+        run: |
+          set -e
+          GL4ES_LIB="$(find "$PWD/gl4es-out" -name libGL.a | head -n1)"
+          echo "gl4es: $GL4ES_LIB"
+          cmake -S rr -B build-game -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$PWD/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DVCPKG_TARGET_TRIPLET=arm64-android \
+            -DVCPKG_MANIFEST_DIR="$GITHUB_WORKSPACE/android-port/vcpkg" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-$API -DANDROID_STL=c++_static \
+            -DSDL3_DIR="$PWD/sdl-install/lib/cmake/SDL3" \
+            -DCMAKE_FIND_ROOT_PATH="$PWD/sdl-install" \
+            -DGL4ES_LIBRARY="$GL4ES_LIB" \
+            -DSRB2_CONFIG_ENABLE_WEBM_MOVIES=OFF \
+            -DSRB2_CONFIG_ENABLE_DISCORDRPC=OFF \
+            -DSRB2_CONFIG_HWRENDER=OFF \
+            -DSRB2_CONFIG_DISABLE_DEBUGLINK=ON \
+            -DSRB2_CONFIG_SKIP_COMPTIME=ON
+          cmake --build build-game --target SRB2SDL2 -j"$(nproc)"
+          find build-game -name 'libmain.so'
+
+      - name: Assemble Android project
+        run: |
+          set -e
+          JNI=android-port/app/src/main/jniLibs/arm64-v8a
+          JAVA=android-port/app/src/main/java/org/libsdl/app
+          mkdir -p "$JNI" "$JAVA"
+          cp "$(find build-game -name libmain.so | head -n1)" "$JNI/"
+          cp sdl-install/lib/libSDL3.so "$JNI/"
+          cp sdl/android-project/app/src/main/java/org/libsdl/app/*.java "$JAVA/"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build APK
+        run: gradle -p android-port assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RingRacers-android-debug-apk
+          path: android-port/app/build/outputs/apk/debug/*.apk
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build-game/CMakeFiles/CMakeConfigureLog.yaml
+            build-game/CMakeCache.txt
+            vcpkg/buildtrees/**/*.log
+          if-no-files-found: ignore
